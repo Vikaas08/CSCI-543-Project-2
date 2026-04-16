@@ -231,7 +231,7 @@ int main(int argc, char** argv) {
     bm.Setup(db_path + "_network_latency", 1024);
     
     // Network latency: typically 10-50ms, occasional spikes >500ms
-    bm.WriteRecords(100000, [](uint64_t i) {
+    bm.WriteRecords(100000, [](uint64_t i) -> uint32_t{
       static std::mt19937 gen(43);
       static std::gamma_distribution<> gamma_dist(2.0, 10.0);  // Right-skewed
       
@@ -258,7 +258,7 @@ int main(int argc, char** argv) {
     bm.Setup(db_path + "_cpu_usage", 1024);
     
     // CPU usage: 0-100%, normally 20-60%, spikes to 100%
-    bm.WriteRecords(100000, [](uint64_t i) {
+    bm.WriteRecords(100000, [](uint64_t i)-> uint32_t {
       static std::mt19937 gen(44);
       static std::normal_distribution<> normal_dist(40, 10);  // Normal: 40%
       

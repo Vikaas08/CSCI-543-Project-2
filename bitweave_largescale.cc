@@ -248,7 +248,7 @@ int main(int argc, char** argv) {
     bm.Setup(db_path + "_1m", 4096);
     
     std::cout << "  Writing 1 million records...\n";
-    bm.WriteRecords(1000000, [](uint64_t i) {
+    bm.WriteRecords(1000000, [](uint64_t i) -> uint32_t{
       static std::mt19937 gen(100);
       static std::normal_distribution<> normal_dist(25, 3);
       
@@ -273,7 +273,7 @@ int main(int argc, char** argv) {
     bm.Setup(db_path + "_10m", 4096);
     
     std::cout << "  Writing 10 million records...\n";
-    bm.WriteRecords(10000000, [](uint64_t i) {
+    bm.WriteRecords(10000000, [](uint64_t i)-> uint32_t {
       static std::mt19937 gen(101);
       static std::normal_distribution<> normal_dist(25, 3);
       
@@ -298,7 +298,7 @@ int main(int argc, char** argv) {
     bm.Setup(db_path + "_50m", 4096);
     
     std::cout << "  Writing 50 million records...\n";
-    bm.WriteRecords(50000000, [](uint64_t i) {
+    bm.WriteRecords(50000000, [](uint64_t i)-> uint32_t {
       static std::mt19937 gen(102);
       static std::gamma_distribution<> gamma_dist(2.0, 10.0);
       
@@ -323,7 +323,7 @@ int main(int argc, char** argv) {
     bm.Setup(db_path + "_100m", 8192);  // Larger block size for bigger data
     
     std::cout << "  Writing 100 million records...\n";
-    bm.WriteRecords(100000000, [](uint64_t i) {
+    bm.WriteRecords(100000000, [](uint64_t i)-> uint32_t {
       static std::mt19937 gen(103);
       static std::exponential_distribution<> exp_dist(0.1);
       
@@ -346,7 +346,7 @@ int main(int argc, char** argv) {
     
     std::cout << "  Writing 500 million records...\n";
     std::cout << "  (This may take several minutes)...\n";
-    bm.WriteRecords(500000000, [](uint64_t i) {
+    bm.WriteRecords(500000000, [](uint64_t i)-> uint32_t {
       static std::mt19937 gen(104);
       static std::normal_distribution<> normal_dist(50, 10);
       
