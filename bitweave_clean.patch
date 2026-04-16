@@ -1,0 +1,805 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index ce8f587..196fb04 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -6,6 +6,8 @@ cmake_minimum_required(VERSION 3.22)
+ # Keep the version below in sync with the one in db.h
+ project(leveldb VERSION 1.23.0 LANGUAGES C CXX)
+ 
++set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -O0")
++
+ # C standard can be overridden when this is used as a sub-project.
+ if(NOT CMAKE_C_STANDARD)
+   # This project can use C11, but will gracefully decay down to C89.
+@@ -517,3 +520,80 @@ if(LEVELDB_INSTALL)
+     DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/${PROJECT_NAME}"
+   )
+ endif(LEVELDB_INSTALL)
++
++add_executable(bench_baseline benchmarks/bench_baseline.cc)
++target_link_libraries(bench_baseline leveldb)
++target_include_directories(bench_baseline PRIVATE include)
++add_executable(bitweave_test 
++  util/testutil.cc
++  table/bitweave_test.cc
++)
++target_link_libraries(bitweave_test
++  leveldb
++  gtest
++  gtest_main
++  gmock  # <-- Add this
++)
++
++target_include_directories(bitweave_test PRIVATE
++  ${CMAKE_SOURCE_DIR}
++)
++
++# BitWeaving Benchmark Target
++add_executable(bitweave_benchmark 
++  ../bitweave_benchmark.cc
++)
++
++target_link_libraries(bitweave_benchmark
++  leveldb
++)
++
++target_include_directories(bitweave_benchmark PRIVATE
++  ${CMAKE_SOURCE_DIR}
++)
++ 
++
++# ============================================================================
++# BitWeaving Real-World Benchmark
++# ============================================================================
++add_executable(bitweave_realworld 
++  ../bitweave_realworld.cc
++)
++
++target_link_libraries(bitweave_realworld
++  leveldb
++)
++
++target_include_directories(bitweave_realworld PRIVATE
++  ${CMAKE_SOURCE_DIR}
++)
++
++# ============================================================================
++# BitWeaving Large-Scale Benchmark
++# ============================================================================
++add_executable(bitweave_largescale 
++  ../bitweave_largescale.cc
++)
++
++target_link_libraries(bitweave_largescale
++  leveldb
++)
++
++target_include_directories(bitweave_largescale PRIVATE
++  ${CMAKE_SOURCE_DIR}
++)
++ 
++
++# BitWeaving Real-Time Producer
++add_executable(bitweave_producer ../bitweave_producer.cc)
++target_link_libraries(bitweave_producer leveldb)
++target_include_directories(bitweave_producer PRIVATE ${CMAKE_SOURCE_DIR})
++
++# BitWeaving Real-Time Consumer
++add_executable(bitweave_consumer ../bitweave_consumer.cc)
++target_link_libraries(bitweave_consumer leveldb)
++target_include_directories(bitweave_consumer PRIVATE ${CMAKE_SOURCE_DIR})
++
++add_executable(bitweave_datagen ../bitweave_datagen_10M.cc)
++target_link_libraries(bitweave_datagen leveldb)
++target_include_directories(bitweave_datagen PRIVATE ${CMAKE_SOURCE_DIR})
+\ No newline at end of file
+diff --git a/include/leveldb/options.h b/include/leveldb/options.h
+index d755f46..9a5f2c3 100644
+--- a/include/leveldb/options.h
++++ b/include/leveldb/options.h
+@@ -6,9 +6,11 @@
+ #define STORAGE_LEVELDB_INCLUDE_OPTIONS_H_
+ 
+ #include <cstddef>
+-
++#include <cstdint>
+ #include "leveldb/export.h"
+ 
++
++
+ namespace leveldb {
+ 
+ class Cache;
+@@ -162,6 +164,8 @@ struct LEVELDB_EXPORT ReadOptions {
+   // not have been released).  If "snapshot" is null, use an implicit
+   // snapshot of the state at the beginning of this read operation.
+   const Snapshot* snapshot = nullptr;
++  uint32_t bw_predicate = 0;
++  char     bw_op        = 0;
+ };
+ 
+ // Options that control write operations
+diff --git a/table/table.cc b/table/table.cc
+index 29e835f..71a754f 100644
+--- a/table/table.cc
++++ b/table/table.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "leveldb/table.h"
+ 
++#include <unordered_map>
++
+ #include "leveldb/cache.h"
+ #include "leveldb/comparator.h"
+ #include "leveldb/env.h"
+@@ -13,10 +15,14 @@
+ #include "table/filter_block.h"
+ #include "table/format.h"
+ #include "table/two_level_iterator.h"
++#include "util/bitweave.h"
+ #include "util/coding.h"
+ 
+ namespace leveldb {
+ 
++// ---------------------------------------------------------------
++// Table::Rep  — internal state for an open SST file
++// ---------------------------------------------------------------
+ struct Table::Rep {
+   ~Rep() {
+     delete filter;
+@@ -33,8 +39,24 @@ struct Table::Rep {
+ 
+   BlockHandle metaindex_handle;  // Handle to metaindex_block: saved from footer
+   Block* index_block;
++
++  // ---- BitWeaving read-path state --------------------------------
++  // bw_data owns the raw bytes of the BWH meta-block while this
++  // Table is open. bw_reader points into those bytes.
++  std::string   bw_data;    // empty → no BitWeaving index in this file
++  BitWeaveReader bw_reader;
++
++  // offset_to_block_index maps the byte offset of each data block
++  // (as stored in the index block) to its sequential 0-based index.
++  // Populated once in Table::Open by walking the index block.
++  // Used by BlockReader to convert a handle offset into a tag index.
++  std::unordered_map<uint64_t, uint32_t> offset_to_block_index;
++  // ----------------------------------------------------------------
+ };
+ 
++// ---------------------------------------------------------------
++// Table::Open
++// ---------------------------------------------------------------
+ Status Table::Open(const Options& options, RandomAccessFile* file,
+                    uint64_t size, Table** table) {
+   *table = nullptr;
+@@ -52,7 +74,7 @@ Status Table::Open(const Options& options, RandomAccessFile* file,
+   s = footer.DecodeFrom(&footer_input);
+   if (!s.ok()) return s;
+ 
+-  // Read the index block
++  // Read the index block.
+   BlockContents index_block_contents;
+   ReadOptions opt;
+   if (options.paranoid_checks) {
+@@ -61,8 +83,6 @@ Status Table::Open(const Options& options, RandomAccessFile* file,
+   s = ReadBlock(file, opt, footer.index_handle(), &index_block_contents);
+ 
+   if (s.ok()) {
+-    // We've successfully read the footer and the index block: we're
+-    // ready to serve requests.
+     Block* index_block = new Block(index_block_contents);
+     Rep* rep = new Table::Rep;
+     rep->options = options;
+@@ -72,38 +92,87 @@ Status Table::Open(const Options& options, RandomAccessFile* file,
+     rep->cache_id = (options.block_cache ? options.block_cache->NewId() : 0);
+     rep->filter_data = nullptr;
+     rep->filter = nullptr;
++
+     *table = new Table(rep);
+     (*table)->ReadMeta(footer);
++
++    // ---- Build offset → block_index map from the index block --------
++    // Walk every entry in the index block.  Each entry's value is a
++    // varint-encoded BlockHandle; its offset field is the byte offset
++    // of the corresponding data block in the file.
++    {
++      Iterator* index_iter =
++          rep->index_block->NewIterator(options.comparator);
++      uint32_t idx = 0;
++      for (index_iter->SeekToFirst(); index_iter->Valid();
++           index_iter->Next(), ++idx) {
++        Slice handle_value = index_iter->value();
++        BlockHandle handle;
++        if (handle.DecodeFrom(&handle_value).ok()) {
++          rep->offset_to_block_index[handle.offset()] = idx;
++        }
++      }
++      delete index_iter;
++    }
+   }
+ 
+   return s;
+ }
+ 
++// ---------------------------------------------------------------
++// ReadMeta  — load filter block and BitWeaving block from meta-index
++// ---------------------------------------------------------------
+ void Table::ReadMeta(const Footer& footer) {
+-  if (rep_->options.filter_policy == nullptr) {
+-    return;  // Do not need any metadata
++  if (rep_->options.filter_policy == nullptr &&
++      rep_->bw_data.empty() /* not yet loaded */) {
++    // No filter policy and we haven't tried loading BW yet.
++    // Still fall through to load BitWeaving if present.
+   }
+ 
+-  // TODO(sanjay): Skip this if footer.metaindex_handle() size indicates
+-  // it is an empty block.
+   ReadOptions opt;
+   if (rep_->options.paranoid_checks) {
+     opt.verify_checksums = true;
+   }
+   BlockContents contents;
+   if (!ReadBlock(rep_->file, opt, footer.metaindex_handle(), &contents).ok()) {
+-    // Do not propagate errors since meta info is not needed for operation
++    // Do not propagate errors since meta info is not needed for operation.
+     return;
+   }
+-  Block* meta = new Block(contents);
+ 
++  Block* meta = new Block(contents);
+   Iterator* iter = meta->NewIterator(BytewiseComparator());
++
++  // Load filter block (unchanged from stock LevelDB).
++  if (rep_->options.filter_policy != nullptr) {
+     std::string key = "filter.";
+-  key.append(rep_->options.filter_policy->Name());
++    key += rep_->options.filter_policy->Name();
+     iter->Seek(key);
+     if (iter->Valid() && iter->key() == Slice(key)) {
+       ReadFilter(iter->value());
+     }
++  }
++
++  // Load BitWeaving block.
++  {
++    iter->Seek(BW_BLOCK_NAME);
++    if (iter->Valid() && iter->key() == Slice(BW_BLOCK_NAME)) {
++      Slice handle_value = iter->value();
++      BlockHandle bw_handle;
++      if (bw_handle.DecodeFrom(&handle_value).ok()) {
++        BlockContents bw_contents;
++        if (ReadBlock(rep_->file, opt, bw_handle, &bw_contents).ok()) {
++          // Copy bytes into rep_->bw_data so the reader has a stable buffer.
++          rep_->bw_data.assign(bw_contents.data.data(),
++                               bw_contents.data.size());
++          if (bw_contents.heap_allocated) {
++            delete[] bw_contents.data.data();
++          }
++          rep_->bw_reader.Init(rep_->bw_data.data(), rep_->bw_data.size());
++        }
++      }
++    }
++  }
++
+   delete iter;
+   delete meta;
+ }
+@@ -115,8 +184,8 @@ void Table::ReadFilter(const Slice& filter_handle_value) {
+     return;
+   }
+ 
+-  // We might want to unify with ReadBlock() if we start
+-  // requiring checksum verification in Table::Open.
++  // We might want to unify with ReadBlock() but let's
++  // preserve the existing stock pattern exactly.
+   ReadOptions opt;
+   if (rep_->options.paranoid_checks) {
+     opt.verify_checksums = true;
+@@ -126,11 +195,14 @@ void Table::ReadFilter(const Slice& filter_handle_value) {
+     return;
+   }
+   if (block.heap_allocated) {
+-    rep_->filter_data = block.data.data();  // Will need to delete later
++    rep_->filter_data = block.data.data();  // Will need to delete later.
+   }
+   rep_->filter = new FilterBlockReader(rep_->options.filter_policy, block.data);
+ }
+ 
++// ---------------------------------------------------------------
++// Table destructor / basic accessors
++// ---------------------------------------------------------------
+ Table::~Table() { delete rep_; }
+ 
+ static void DeleteBlock(void* arg, void* ignored) {
+@@ -148,8 +220,13 @@ static void ReleaseBlock(void* arg, void* h) {
+   cache->Release(handle);
+ }
+ 
+-// Convert an index iterator value (i.e., an encoded BlockHandle)
+-// into an iterator over the contents of the corresponding block.
++// ---------------------------------------------------------------
++// BlockReader — the hot path; this is where we gate on MayMatch()
++// ---------------------------------------------------------------
++// Convert an index_value (encoded BlockHandle) into a Block iterator.
++// If BitWeaving says this block cannot satisfy the predicate in
++// options.bw_op / options.bw_predicate, return an empty iterator
++// immediately without touching the disk.
+ Iterator* Table::BlockReader(void* arg, const ReadOptions& options,
+                              const Slice& index_value) {
+   Table* table = reinterpret_cast<Table*>(arg);
+@@ -160,12 +237,31 @@ Iterator* Table::BlockReader(void* arg, const ReadOptions& options,
+   BlockHandle handle;
+   Slice input = index_value;
+   Status s = handle.DecodeFrom(&input);
+-  // We intentionally allow extra stuff in index_value so that we
+-  // can add more features in the future.
++
++  // ---- BitWeaving filter check ------------------------------------
++  // Only evaluate if:
++  //   1. We have a valid reader (the BWH block was found and parsed).
++  //   2. The caller supplied a predicate (bw_op != 0).
++  if (s.ok() && table->rep_->bw_reader.valid() &&
++    options.bw_op != 0) {
++
++ 
++  
++  auto it = table->rep_->offset_to_block_index.find(handle.offset());
++  if (it != table->rep_->offset_to_block_index.end()) {
++    uint32_t block_index = it->second;
++    bool may_match = table->rep_->bw_reader.MayMatch(block_index, options.bw_predicate, options.bw_op);
++    if (!may_match) {
++      return NewEmptyIterator();
++    }
++  } 
++}
++  // -----------------------------------------------------------------
+ 
+   if (s.ok()) {
+     BlockContents contents;
+     if (block_cache != nullptr) {
++      // Try the block cache first.
+       char cache_key_buffer[16];
+       EncodeFixed64(cache_key_buffer, table->rep_->cache_id);
+       EncodeFixed64(cache_key_buffer + 8, handle.offset());
+@@ -205,6 +301,9 @@ Iterator* Table::BlockReader(void* arg, const ReadOptions& options,
+   return iter;
+ }
+ 
++// ---------------------------------------------------------------
++// NewIterator / InternalGet / ApproximateOffsetOf (stock, unchanged)
++// ---------------------------------------------------------------
+ Iterator* Table::NewIterator(const ReadOptions& options) const {
+   return NewTwoLevelIterator(
+       rep_->index_block->NewIterator(rep_->options.comparator),
+@@ -223,7 +322,7 @@ Status Table::InternalGet(const ReadOptions& options, const Slice& k, void* arg,
+     BlockHandle handle;
+     if (filter != nullptr && handle.DecodeFrom(&handle_value).ok() &&
+         !filter->KeyMayMatch(handle.offset(), k)) {
+-      // Not found
++      // Not found via bloom filter
+     } else {
+       Iterator* block_iter = BlockReader(this, options, iiter->value());
+       block_iter->Seek(k);
+@@ -261,7 +360,7 @@ uint64_t Table::ApproximateOffsetOf(const Slice& key) const {
+   } else {
+     // key is past the last key in the file.  Approximate the offset
+     // by returning the offset of the metaindex block (which is
+-    // right near the end of the file).
++    // temporary; this is good enough).
+     result = rep_->metaindex_handle.offset();
+   }
+   delete index_iter;
+diff --git a/table/table_builder.cc b/table/table_builder.cc
+index 0932c94..9b67c70 100644
+--- a/table/table_builder.cc
++++ b/table/table_builder.cc
+@@ -15,6 +15,7 @@
+ #include "table/format.h"
+ #include "util/coding.h"
+ #include "util/crc32c.h"
++#include "util/bitweave.h"
+ 
+ namespace leveldb {
+ 
+@@ -47,15 +48,9 @@ struct TableBuilder::Rep {
+   bool closed;  // Either Finish() or Abandon() has been called.
+   FilterBlockBuilder* filter_block;
+ 
+-  // We do not emit the index entry for a block until we have seen the
+-  // first key for the next data block.  This allows us to use shorter
+-  // keys in the index block.  For example, consider a block boundary
+-  // between the keys "the quick brown fox" and "the who".  We can use
+-  // "the r" as the key for the index block entry since it is >= all
+-  // entries in the first block and < all entries in subsequent
+-  // blocks.
+-  //
+-  // Invariant: r->pending_index_entry is true only if data_block is empty.
++  // BitWeaving: one tag per physical data block.
++  BitWeaveBuilder bw_builder;
++
+   bool pending_index_entry;
+   BlockHandle pending_handle;  // Handle to add to index block
+ 
+@@ -76,15 +71,10 @@ TableBuilder::~TableBuilder() {
+ }
+ 
+ Status TableBuilder::ChangeOptions(const Options& options) {
+-  // Note: if more fields are added to Options, update
+-  // this function to catch changes that should not be allowed to
+-  // change in the middle of building a Table.
+   if (options.comparator != rep_->options.comparator) {
+     return Status::InvalidArgument("changing comparator while building table");
+   }
+ 
+-  // Note that any live BlockBuilders point to rep_->options and therefore
+-  // will automatically pick up the updated options.
+   rep_->options = options;
+   rep_->index_block_options = options;
+   rep_->index_block_options.block_restart_interval = 1;
+@@ -112,6 +102,22 @@ void TableBuilder::Add(const Slice& key, const Slice& value) {
+     r->filter_block->AddKey(key);
+   }
+ 
++  // BitWeaving: parse value as uint32 and feed to the per-block accumulator.
++  // Non-numeric values contribute 0 (safe: they just add a band-0 bit to the
++  // mask, which may cause false positives but never false negatives).
++  {
++    uint32_t bw_val = 0;
++    bool parse_ok = !value.empty();
++    for (size_t i = 0; parse_ok && i < value.size(); i++) {
++      if (value[i] < '0' || value[i] > '9') {
++        parse_ok = false;
++      } else {
++        bw_val = bw_val * 10 + static_cast<uint32_t>(value[i] - '0');
++      }
++    }
++    r->bw_builder.AddValue(bw_val);
++  }
++
+   r->last_key.assign(key.data(), key.size());
+   r->num_entries++;
+   r->data_block.Add(key, value);
+@@ -128,6 +134,13 @@ void TableBuilder::Flush() {
+   if (!ok()) return;
+   if (r->data_block.empty()) return;
+   assert(!r->pending_index_entry);
++
++  // Commit the current block's accumulated BitWeaving values as one tag
++  // BEFORE WriteBlock() resets the BlockBuilder.  This must happen here,
++  // not inside WriteBlock(), so that only data blocks produce tags (not
++  // meta/index blocks, which are also written via WriteBlock()).
++  r->bw_builder.FlushBlock();
++
+   WriteBlock(&r->data_block, &r->pending_handle);
+   if (ok()) {
+     r->pending_index_entry = true;
+@@ -139,17 +152,13 @@ void TableBuilder::Flush() {
+ }
+ 
+ void TableBuilder::WriteBlock(BlockBuilder* block, BlockHandle* handle) {
+-  // File format contains a sequence of blocks where each block has:
+-  //    block_data: uint8[n]
+-  //    type: uint8
+-  //    crc: uint32
+   assert(ok());
+   Rep* r = rep_;
+   Slice raw = block->Finish();
+ 
+   Slice block_contents;
+   CompressionType type = r->options.compression;
+-  // TODO(postrelease): Support more compression options: zlib?
++
+   switch (type) {
+     case kNoCompression:
+       block_contents = raw;
+@@ -161,8 +170,6 @@ void TableBuilder::WriteBlock(BlockBuilder* block, BlockHandle* handle) {
+           compressed->size() < raw.size() - (raw.size() / 8u)) {
+         block_contents = *compressed;
+       } else {
+-        // Snappy not supported, or compressed less than 12.5%, so just
+-        // store uncompressed form
+         block_contents = raw;
+         type = kNoCompression;
+       }
+@@ -176,8 +183,6 @@ void TableBuilder::WriteBlock(BlockBuilder* block, BlockHandle* handle) {
+           compressed->size() < raw.size() - (raw.size() / 8u)) {
+         block_contents = *compressed;
+       } else {
+-        // Zstd not supported, or compressed less than 12.5%, so just
+-        // store uncompressed form
+         block_contents = raw;
+         type = kNoCompression;
+       }
+@@ -199,7 +204,7 @@ void TableBuilder::WriteRawBlock(const Slice& block_contents,
+     char trailer[kBlockTrailerSize];
+     trailer[0] = type;
+     uint32_t crc = crc32c::Value(block_contents.data(), block_contents.size());
+-    crc = crc32c::Extend(crc, trailer, 1);  // Extend crc to cover block type
++    crc = crc32c::Extend(crc, trailer, 1);
+     EncodeFixed32(trailer + 1, crc32c::Mask(crc));
+     r->status = r->file->Append(Slice(trailer, kBlockTrailerSize));
+     if (r->status.ok()) {
+@@ -212,7 +217,7 @@ Status TableBuilder::status() const { return rep_->status; }
+ 
+ Status TableBuilder::Finish() {
+   Rep* r = rep_;
+-  Flush();
++  Flush();  // flushes the last data block (also calls bw_builder.FlushBlock())
+   assert(!r->closed);
+   r->closed = true;
+ 
+@@ -224,11 +229,22 @@ Status TableBuilder::Finish() {
+                   &filter_block_handle);
+   }
+ 
+-  // Write metaindex block
++  // Write BitWeaving meta-block
++  // Finish() handles any trailing values not yet flushed (shouldn't happen
++  // since Flush() above calls FlushBlock(), but it's a safe guard).
++  BlockHandle bw_block_handle;
++  bool wrote_bw_block = false;
++  if (ok() && r->bw_builder.NumBlocks() > 0) {
++    std::string bw_block;
++    r->bw_builder.Finish(&bw_block);
++    WriteRawBlock(Slice(bw_block), kNoCompression, &bw_block_handle);
++    wrote_bw_block = true;
++  }
++
++  // Write meta-index block
+   if (ok()) {
+     BlockBuilder meta_index_block(&r->options);
+     if (r->filter_block != nullptr) {
+-      // Add mapping from "filter.Name" to location of filter data
+       std::string key = "filter.";
+       key.append(r->options.filter_policy->Name());
+       std::string handle_encoding;
+@@ -236,7 +252,12 @@ Status TableBuilder::Finish() {
+       meta_index_block.Add(key, handle_encoding);
+     }
+ 
+-    // TODO(postrelease): Add stats and other meta blocks
++    if (wrote_bw_block) {
++      std::string handle_encoding;
++      bw_block_handle.EncodeTo(&handle_encoding);
++      meta_index_block.Add(BW_BLOCK_NAME, handle_encoding);
++    }
++
+     WriteBlock(&meta_index_block, &metaindex_block_handle);
+   }
+ 
+diff --git a/util/bitweave.h b/util/bitweave.h
+new file mode 100644
+index 0000000..a6a785d
+--- /dev/null
++++ b/util/bitweave.h
+@@ -0,0 +1,228 @@
++#pragma once
++#include <iostream>
++#include <cstdint>
++#include <cstring>
++#include <string>
++#include <vector>
++#include <algorithm>
++#include <limits>
++
++// =============================================================
++// BitWeaving/H for LevelDB  —  Phase 2 (Option A: per-block tags)
++// =============================================================
++// One tag per physical SST data block.
++// tag[i] summarises the value range of the i-th data block written.
++// At query time, BlockReader looks up tag[block_index] before doing
++// any I/O.  If MayMatch() returns false the read is skipped entirely.
++//
++// Three things in this file:
++//   1. Constants
++//   2. BitWeaveBuilder  — used when WRITING an SST
++//   3. BitWeaveReader   — used when READING an SST
++// =============================================================
++
++namespace leveldb {
++
++// ---------------------------------------------------------------
++// Constants
++// ---------------------------------------------------------------
++
++// How many bands to divide the value range into.
++// 32 fits in one uint32_t — one bit per band.
++static const int BW_NUM_BANDS  = 32;
++
++// The name used to store our block in LevelDB's Meta-Index.
++static const char* BW_BLOCK_NAME = "bitweave.leveldb.BWH";
++
++
++// ---------------------------------------------------------------
++// Helper: map a single value into a band number [0..31]
++// ---------------------------------------------------------------
++inline int bw_value_to_band(uint32_t value, uint32_t min_val, uint32_t max_val) {
++  if (max_val <= min_val) return 0;
++  uint64_t range  = (uint64_t)max_val - min_val + 1;
++  uint64_t offset = (value < min_val) ? 0 : (uint64_t)value - min_val;
++  int band = (int)((offset * BW_NUM_BANDS) / range);
++  if (band < 0)             band = 0;
++  if (band >= BW_NUM_BANDS) band = BW_NUM_BANDS - 1;
++  return band;
++}
++
++
++// ---------------------------------------------------------------
++// BitWeaveBuilder  (Option A: one tag per physical data block)
++//
++// Usage in table_builder.cc:
++//   1. Call AddValue(v) for every record added to the current block.
++//   2. Call FlushBlock() when WriteBlock() is called for a data block.
++//      This commits the current block's accumulated min/max/mask as
++//      one tag entry and resets the accumulator for the next block.
++//   3. Call Finish(dst) once, at SST finalisation, to serialise all
++//      committed tags into the BWH meta-block.
++//
++// Block format written:
++//   [ 4 bytes: num_blocks (uint32_t) ]
++//   Per block:
++//     [ 4 bytes: block_min  (uint32_t) ]
++//     [ 4 bytes: block_max  (uint32_t) ]
++//     [ 4 bytes: bitmask    (uint32_t) ]
++//   Total per block: 12 bytes
++// ---------------------------------------------------------------
++class BitWeaveBuilder {
++ public:
++  BitWeaveBuilder() { ResetAccumulator(); }
++
++  // Call once per record value as the SST is being built.
++  void AddValue(uint32_t value) {
++    if (value < cur_min_) cur_min_ = value;
++    if (value > cur_max_) cur_max_ = value;
++    cur_values_.push_back(value);
++  }
++
++  // Call at every WriteBlock() for a data block.
++  // Commits the current accumulator as one tag and resets it.
++  void FlushBlock() {
++    if (cur_values_.empty()) {
++      // Empty block: emit a tag that never matches anything.
++      uint32_t entry[3] = {
++          std::numeric_limits<uint32_t>::max(),  // min
++          0,                                      // max  (max < min → impossible range)
++          0                                       // mask (all bands empty)
++      };
++      tags_.append(reinterpret_cast<char*>(entry), 12);
++      num_blocks_++;
++      ResetAccumulator();
++      return;
++    }
++
++    // Build bitmask using this block's own local min/max
++    // (local normalisation gives better band precision per block).
++    uint32_t mask = 0;
++    for (uint32_t v : cur_values_) {
++      int band = bw_value_to_band(v, cur_min_, cur_max_);
++      mask |= (1u << band);
++    }
++
++    uint32_t entry[3] = { cur_min_, cur_max_, mask };
++    tags_.append(reinterpret_cast<char*>(entry), 12);
++    num_blocks_++;
++    ResetAccumulator();
++  }
++
++  // Call once when the SST is finalised to write the BWH meta-block.
++  // Any values accumulated since the last FlushBlock() are flushed
++  // automatically (handles the last partial block).
++  void Finish(std::string* dst) {
++    // Flush any trailing values that didn't get a FlushBlock() call
++    // (this happens for the very last data block if Finish() is called
++    //  before the caller has a chance to call FlushBlock()).
++    if (!cur_values_.empty()) {
++      FlushBlock();
++    }
++
++    if (num_blocks_ == 0) return;
++
++    // Write: [num_blocks][tag0][tag1]...[tagN-1]
++    uint32_t nb = static_cast<uint32_t>(num_blocks_);
++    dst->append(reinterpret_cast<char*>(&nb), 4);
++    dst->append(tags_);
++  }
++
++  void Reset() {
++    tags_.clear();
++    num_blocks_ = 0;
++    ResetAccumulator();
++  }
++
++  size_t NumBlocks() const { return num_blocks_; }
++  // Returns true if there are uncommitted values (i.e. AddValue() was
++  // called since the last FlushBlock()).
++  bool HasPendingValues() const { return !cur_values_.empty(); }
++
++ private:
++  void ResetAccumulator() {
++    cur_min_ = std::numeric_limits<uint32_t>::max();
++    cur_max_ = 0;
++    cur_values_.clear();
++  }
++
++  // Committed tag bytes (each group is 12 bytes: min, max, mask).
++  std::string tags_;
++  size_t      num_blocks_ = 0;
++
++  // Accumulator for the block currently being built.
++  uint32_t              cur_min_;
++  uint32_t              cur_max_;
++  std::vector<uint32_t> cur_values_;
++};
++
++
++// ---------------------------------------------------------------
++// BitWeaveReader
++//
++// Used inside Table when READING an SST file.
++// Call Init() with the raw BWH block bytes once when SST is opened.
++// Call MayMatch() for each data block during a scan.
++//
++// MayMatch returns:
++//   true  → block MIGHT contain matching values → proceed with I/O
++//   false → block CANNOT contain matching values → skip I/O
++//
++// false negatives are impossible (we never wrongly skip).
++// false positives are ok  (we sometimes read when not needed).
++// ---------------------------------------------------------------
++class BitWeaveReader {
++ public:
++  BitWeaveReader() : data_(nullptr), num_blocks_(0) {}
++
++  // Call once after loading the BWH block from the SST.
++  // Returns false if the block is malformed.
++  bool Init(const char* data, size_t size) {
++    if (size < 4) return false;
++
++    memcpy(&num_blocks_, data, 4);
++
++    size_t expected = 4 + (size_t)num_blocks_ * 12;
++    if (size < expected) return false;
++
++    // Point past the 4-byte header to the first tag entry.
++    data_ = data + 4;
++    return true;
++  }
++
++  // Call before issuing I/O for the block with the given index.
++  // block_index is 0-based; it must match the order tags were emitted
++  // by BitWeaveBuilder::FlushBlock().
++  //
++  // threshold: the literal value in the WHERE clause  (e.g. 800)
++  // op:        '>' or '<'
++ bool MayMatch(uint32_t block_index, uint32_t threshold, char op) const {
++if (data_ == nullptr || block_index >= num_blocks_) return true;
++
++    const uint32_t* entry =
++        reinterpret_cast<const uint32_t*>(data_ + block_index * 12);
++    uint32_t bmin = entry[0];
++    uint32_t bmax = entry[1];
++    uint32_t mask = entry[2];
++
++   
++
++    // Simple min/max range check
++    if (op == '>') {
++      return bmax > threshold;
++    } else if (op == '<') {
++      return bmin < threshold;
++    }
++    
++    return true;
++}
++
++  bool     valid()       const { return data_ != nullptr; }
++  uint32_t num_blocks()  const { return num_blocks_; }
++
++ private:
++  const char* data_;        // points into the loaded BWH block
++  uint32_t    num_blocks_;
++};
++
++} // namespace leveldb
+\ No newline at end of file

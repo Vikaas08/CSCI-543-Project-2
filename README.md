@@ -75,19 +75,26 @@ We built three distinct benchmark binaries to stress-test different system limit
 > **Note:** Raw execution logs from our evaluation have been exported and saved in the `benchmark_results/` directory at the root of this repository for immediate review.
 
 ---
+## 🚀 Key Achievements
 
-## 🧪 Concurrent Live-Streaming Simulation
+* **Up to 89.38% reduction in disk I/O**: Verified during High Disk I/O anomaly detection queries where BitWeaving effectively skipped non-matching blocks, resulting in a significant decrease in disk reads.This was particularly evident in scenarios with high selectivity, where the majority of blocks were irrelevant to the query predicate. The reduction in disk I/O directly contributed to faster query execution times and improved overall system performance.
+* **Up to 10.19x latency speedup**: Demonstrated in real-world scenarios, reducing scan times from 6.77 ms to 0.66 ms. This speedup is attributed to the elimination of unnecessary disk access and the efficient in-memory evaluation of bitmasks, allowing the engine to quickly determine which blocks to read and which to skip. The latency improvement was most pronounced in cases where a large portion of the data was irrelevant to the query, showcasing the effectiveness of BitWeaving in optimizing value-based range scans.
+* **Highly optimized storage footprint**: Proven at a scale of 500 million records, where metadata overhead remained typically < 1% of total data. The compact metadata payload for each data block ensures that the additional storage requirements do not significantly impact the overall storage efficiency of the engine, even at large scales.
 
-To prove our BitWeaving implementation is thread-safe and respects LevelDB's Snapshot isolation, we included a live producer/consumer simulation.
 
-Open two terminals in the `build/` directory:
-```bash
-# Terminal 1: Continuously writes streaming data (simulates sensor logs)
-./bitweave_producer /tmp/live_db
 
-# Terminal 2: Concurrently executes sliding-window temporal range queries
-./bitweave_consumer /tmp/live_db
-```
+---
+## 👥 Team Members
+
+* [Aryan Parab](mailto:amparab@usc.edu)
+* [Vikas Mishra](mailto:vikasmis@usc.edu)
+* [Nishant Miyani](mailto:miyani@usc.edu)
+---
+
+## 🎓 Academic Context
+
+* **Instructor:** [Prof. Ibrahim Sabek](https://viterbi-web.usc.edu/~sabek/)
+* **Course:** CSCI 543: Foundations of Modern Data Management and Processing, University of Southern California
 
 ---
 
@@ -95,6 +102,5 @@ Open two terminals in the `build/` directory:
 
 - **Language:** C++17
 - **Base Engine:** Google LevelDB (v1.23.0)
-- **Testing:** GoogleTest (GTest), Google Benchmark
 - **Build System:** CMake, Make
 - **Environment:** Linux / Docker Containerization
