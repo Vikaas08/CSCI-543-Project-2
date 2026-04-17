@@ -10,14 +10,18 @@ An architectural modification to Google's **LevelDB** storage engine, implementi
 
 ## 🚀 Project Overview
 
-Standard LSM-trees natively sort data by key, making value-based range scans highly inefficient as they force the engine to read, decompress, and deserialize every block in the queried range. 
+**The Problem: Inefficient Value Scans in LSM-Trees**
+Standard LSM-trees natively sort data by key. This makes value-based range scans (e.g., `SELECT * WHERE value > 800`) highly inefficient, as it forces the engine into severe read amplification—requiring it to read, decompress, and deserialize every single block in the queried range just to evaluate the predicate. 
 
-This project modifies the LevelDB core engine to generate and store 32-bit dynamic bitmasks combined with ZoneMaps (Min/Max) for every 64-record cache-aligned block. During a range scan, the engine evaluates these bitmasks in memory, safely bypassing disk I/O entirely for blocks that do not match the query predicate.
+**The Solution: Embedded BitWeaving Filters**
+This project modifies the LevelDB core engine to generate and store 32-bit dynamic bitmasks, combined with Hybrid ZoneMaps (Min/Max), for every 64-record cache-aligned data block. 
 
-**Key Achievements:**
-* Up to **89.38% reduction** in disk I/O for high-selectivity queries.
-* Up to **10.19x latency speedup**.
-* Highly optimized storage footprint (**< 0.1% space overhead**) proven at a scale of 500 million records.
+During a range scan, the engine evaluates these bitmasks in memory. If the filter determines a block cannot satisfy the query predicate, the engine safely bypasses the disk I/O entirely for that block.
+
+### Key Achievements
+* **Up to 89.38% reduction** in disk I/O for high-selectivity queries.
+* **Up to 10.19x latency speedup** on read-heavy workloads.
+* **< 0.1% space overhead**, maintaining a highly optimized storage footprint proven at a scale of 500 million records.
 
 ---
 
@@ -28,16 +32,31 @@ Per the project requirements, our modifications successfully hijacked the read/w
 ### 1. The Core Logic Engine
 * **`util/bitweave.h`**: We built a header-only mathematical engine containing `BitWeaveBuilder` and `BitWeaveReader`. It utilizes a Hybrid ZoneMap approach, dynamically dividing the local range of a 64-record block into 32 equal bands to generate highly precise bitmasks.
 
+* **The 12-Byte Binary Signature:** For every 64-record data block, we generate a highly compact metadata payload. This incurs an incredibly lightweight **~0.29% storage overhead**.
+
+```cpp
+struct BitWeaveTag {
+    uint32_t block_min;  // 4 Bytes: Local ZoneMap Minimum
+    uint32_t block_max;  // 4 Bytes: Local ZoneMap Maximum
+    uint32_t bitmask;    // 4 Bytes: 32-Band Distribution Mask
+}; 
+```
+
+* **Dynamic Bitmasking Algorithm:** Instead of global SSTable boundaries, we calculate boundaries dynamically for each physical block. A value `v` is assigned to one of 32 bands using the formula: 
+  `band = floor(((v - min) * 32) / (max - min + 1))`
+
+
 ### 2. The Write Path (Compaction)
-* **`table/table_builder.cc`**: Intercepted the `TableBuilder::Add()` function to parse string slices into integers. When `TableBuilder::Finish()` is called, our logic bundles the generated bitmasks into a 12-byte payload and writes it to disk as a custom `bitweave.leveldb.BWH` Meta-Index block.
+* **`table/table_builder.cc`**: Intercepted the `TableBuilder::Add()` function to parse string slices into integers. When `TableBuilder::Flush()` completes a physical data block, our logic commits the corresponding 12-byte `BitWeaveTag`. During `TableBuilder::Finish()`, our logic bundles the generated bitmasks into a 12-byte payload and writes it to disk as a custom `bitweave.leveldb.BWH` Meta-Index block, resting alongside standard Bloom filters.
 
 ### 3. The Read Path (Query Filtering)
 * **`table/table.cc`**: 
-  * Modified `Table::Open` to load the BitWeaving metadata into an in-memory `std::unordered_map` for O(1) index lookups.
+  * Modified `Table::Open` to load the BitWeaving metadata into an in-memory `std::unordered_map` for O(1) index lookups. This translates physical disk offsets into our BitWeaving tags, enabling lightning-fast access during reads.
   * Intercepted `Table::BlockReader` (the final step before Disk/Cache I/O). If our BitWeaving filter returns `false` for a block, we immediately return `NewEmptyIterator()`, completely avoiding decompression and disk access.
 
 ### 4. The Evaluation Framework
-* **`bitweave_*.cc`**: We initially considered evaluating our BitWeaving implementation using standard frameworks like YCSB Workload E or LevelDB's native db_bench. However, these industry-standard tools treat the storage engine as a black box, measuring only top-level latency and throughput. Because BitWeaving's primary contribution is avoiding disk I/O at the block level, we constructed a native C++ benchmarking suite that mirrors the read-heavy access patterns of YCSB Workload E, while instrumenting the internal engine to accurately report cache utilization, block-skipping rates, and metadata storage overhead."
+* **`bitweave_*.cc`**: We initially considered evaluating our BitWeaving implementation using standard frameworks like `YCSB Workload E` or LevelDB's native `db_bench`. However, these industry-standard tools treat the storage engine as a black box, measuring only top-level latency and throughput. Because BitWeaving's primary contribution is avoiding disk I/O at the block level, we constructed a native C++ benchmarking suite that mirrors the read-heavy access patterns of YCSB Workload E, while instrumenting the internal engine to accurately report cache utilization, block-skipping rates, and metadata storage overhead."
+
 
 ---
 
@@ -56,14 +75,19 @@ Runs unit tests to guarantee 0% false negatives in the bitmask logic, and a 10,0
 ```bash
 ./bitweave_test
 ```
+<p align="left">
+  <img src="benchmark_results/results.png" width="50%">
+</p>
+
+
 ### 3. Run the Evaluation Suite
 We built three distinct benchmark binaries to stress-test different system limits:
 
-* **Micro-Benchmarks (Distributions):** Tests Uniform, Skewed, and Bimodal data distributions.
+* **Micro-Benchmarks (Distributions):** Tests the bitmask resolution against Uniform, Skewed, and Bimodal data distributions to measure worst-case vs. best-case selectivity.
   ```bash
   ./bitweave_benchmark
   ```
-* **Real-World Simulation:** Tests realistic access patterns including IoT temperature anomalies, DB query latencies, and CPU spikes.
+* **Real-World Simulation:** Runs the engine against simulated IoT temperature anomalies, network logs, and CPU spikes to measure latency speedups in production-like environments.
   ```bash
   ./bitweave_realworld
   ```
@@ -75,7 +99,12 @@ We built three distinct benchmark binaries to stress-test different system limit
 > **Note:** Raw execution logs from our evaluation have been exported and saved in the `benchmark_results/` directory at the root of this repository for immediate review.
 
 ---
-## 🚀 Key Achievements
+## 📊 Performance & Key Achievements
+
+<p align="center">
+  <img src="benchmark_results/bitweave_performance.png" alt="BitWeaving Performance Metrics" width="100%">
+</p>
+<p align="center"><i>Figure 1: Comprehensive evaluation across micro-benchmarks, real-world workloads, and scalability stress-tests.</i></p>
 
 * **Up to 89.38% reduction in disk I/O**: Verified during High Disk I/O anomaly detection queries where BitWeaving effectively skipped non-matching blocks, resulting in a significant decrease in disk reads.This was particularly evident in scenarios with high selectivity, where the majority of blocks were irrelevant to the query predicate. The reduction in disk I/O directly contributed to faster query execution times and improved overall system performance.
 * **Up to 10.19x latency speedup**: Demonstrated in real-world scenarios, reducing scan times from 6.77 ms to 0.66 ms. This speedup is attributed to the elimination of unnecessary disk access and the efficient in-memory evaluation of bitmasks, allowing the engine to quickly determine which blocks to read and which to skip. The latency improvement was most pronounced in cases where a large portion of the data was irrelevant to the query, showcasing the effectiveness of BitWeaving in optimizing value-based range scans.
