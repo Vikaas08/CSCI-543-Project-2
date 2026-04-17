@@ -22,8 +22,20 @@ During a range scan, the engine evaluates these bitmasks in memory. If the filte
 * **Up to 89.38% reduction** in disk I/O for high-selectivity queries.
 * **Up to 10.19x latency speedup** on read-heavy workloads.
 * **< 0.1% space overhead**, maintaining a highly optimized storage footprint proven at a scale of 500 million records.
+---
+
+## 💡 Target Use Cases
+
+While standard LevelDB excels at point-lookups (key-value retrieval), our BitWeaving integration transforms it into a highly efficient engine for analytical and time-series workloads. This unlocks massive performance gains in the following scenarios:
+
+### 1. Financial Market Data & Algorithmic Backtesting
+High-frequency trading platforms frequently utilize LevelDB as an ultra-fast local cache for order book events and price ticks (where the key is the timestamp and the value contains the trade metrics). When quantitative analysts run backtests, they often execute highly selective value-based queries—such as searching for liquidity spikes (`WHERE trade_volume > 50000`) within a specific historical window. Standard LevelDB forces the system to decompress and read every single market tick in that time frame. BitWeaving instantly filters out the "normal" trading blocks, drastically accelerating backtest execution and allowing quants to iterate on financial models much faster.
+
+### 2. High-Throughput Infrastructure Monitoring (Anomaly Detection)
+In cloud infrastructure environments, distributed systems generate massive volumes of diagnostic logs (network latency, CPU utilization, disk I/O throughput). When Site Reliability Engineers (SREs) query these logs to detect SLO violations (e.g., `SELECT * WHERE latency > 500ms`), the vast majority of the data is "normal" and irrelevant to the query. BitWeaving's highly selective O(1) filtering allows the storage engine to instantly skip the normal logs, reducing read amplification and speeding up root-cause analysis by an order of magnitude.
 
 ---
+
 
 ## 📍 Code Map: What We Added
 
@@ -43,7 +55,7 @@ struct BitWeaveTag {
 ```
 
 * **Dynamic Bitmasking Algorithm:** Instead of global SSTable boundaries, we calculate boundaries dynamically for each physical block. A value `v` is assigned to one of 32 bands using the formula: 
-  `band = floor(((v - min) * 32) / (max - min + 1))`
+  `band = floor(((v - min) * 32) / (max - min + 1))`    
 
 
 ### 2. The Write Path (Compaction)
